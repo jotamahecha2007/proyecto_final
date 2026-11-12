@@ -1,0 +1,73 @@
+{
+  "expo": {
+    "name": "TeAyudo",
+    "slug": "teayudo",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "automatic",
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "co.edu.unisabana.teayudo",
+      "infoPlist": {
+        "NSLocationWhenInUseUsageDescription": "TeAyudo usa tu ubicación para encontrar prestadores cerca de ti.",
+        "NSPhotoLibraryUsageDescription": "TeAyudo usa tus fotos y videos para enviarlos por el chat.",
+        "NSMicrophoneUsageDescription": "TeAyudo usa el micrófono para grabar notas de voz en el chat.",
+        "NSCameraUsageDescription": "TeAyudo usa la cámara para tomar fotos del problema que necesitas resolver."
+      }
+    },
+    "android": {
+      "adaptiveIcon": {
+        "backgroundColor": "#E6F4FE",
+        "foregroundImage": "./assets/android-icon-foreground.png",
+        "backgroundImage": "./assets/android-icon-background.png",
+        "monochromeImage": "./assets/android-icon-monochrome.png"
+      },
+      "predictiveBackGestureEnabled": false,
+      "package": "co.edu.unisabana.teayudo",
+      "permissions": [
+        "ACCESS_COARSE_LOCATION",
+        "ACCESS_FINE_LOCATION"
+      ]
+    },
+    "web": {
+      "favicon": "./assets/favicon.png"
+    },
+    "plugins": [
+      "expo-router",
+      "expo-status-bar",
+      [
+        "expo-location",
+        {
+          "locationWhenInUsePermission": "TeAyudo usa tu ubicación para encontrar prestadores cerca de ti."
+        }
+      ],
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "TeAyudo usa tus fotos y videos para enviarlos por el chat.",
+          "cameraPermission": "TeAyudo usa la cámara para tomar fotos del problema que necesitas resolver."
+        }
+      ],
+      [
+        "expo-audio",
+        {
+          "microphonePermission": "TeAyudo usa el micrófono para grabar notas de voz en el chat."
+        }
+      ],
+      "expo-video",
+      [
+        "expo-notifications",
+        {
+          "color": "#1C3D8F"
+        }
+      ],
+      "expo-font",
+      "expo-sharing"
+    ],
+    "scheme": "teayudo",
+    "experiments": {
+      "typedRoutes": true
+    }
+  }
+}

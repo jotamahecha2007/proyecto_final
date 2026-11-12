@@ -1,0 +1,29 @@
+rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+    // Archivos del chat: solo los dos participantes los leen.
+    // Imágenes hasta 5 MB, notas de voz hasta 10 MB y videos hasta 25 MB.
+    // Fotos del problema en una solicitud: las sube el cliente y las ven los prestadores.
+    match /requests/{userId}/{file} {
+      allow read: if request.auth != null;
+      allow create: if request.auth != null && request.auth.uid == userId
+        && request.resource.contentType.matches('image/.*')
+        && request.resource.size < 5 * 1024 * 1024;
+    }
+
+    match /chats/{chatId}/{file} {
+      function isParticipant() {
+        return request.auth != null &&
+          request.auth.uid in firestore.get(/databases/(default)/documents/chats/$(chatId)).data.participants;
+      }
+      allow read: if isParticipant();
+      allow create: if isParticipant()
+        && file.matches(request.auth.uid + '_.*')
+        && (
+          (request.resource.contentType.matches('image/.*') && request.resource.size < 5 * 1024 * 1024) ||
+          (request.resource.contentType.matches('audio/.*') && request.resource.size < 10 * 1024 * 1024) ||
+          (request.resource.contentType.matches('video/.*') && request.resource.size < 25 * 1024 * 1024)
+        );
+    }
+  }
+}

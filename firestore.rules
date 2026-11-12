@@ -1,0 +1,286 @@
+rules_version = '2';
+
+// Reglas de seguridad de TeAyudo.
+// Principio: la app solo escribe lo que le corresponde a cada rol. Las estadísticas
+// y el Trust Score los escribe exclusivamente la Cloud Function (Admin SDK, que
+// no pasa por estas reglas), para que nadie pueda inflar su propio puntaje.
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() { return request.auth != null; }
+    function uid() { return request.auth.uid; }
+    function unchanged(keys) { return !request.resource.data.diff(resource.data).affectedKeys().hasAny(keys); }
+    function onlyChanges(keys) { return request.resource.data.diff(resource.data).affectedKeys().hasOnly(keys); }
+    // Administrador: lo marca el servidor con un "custom claim" (no se puede asignar desde la app).
+    // Puede LEER casi todo para moderar; todo lo que CAMBIA lo hace por Cloud Functions, que dejan bitácora.
+    function isAdmin() { return signedIn() && request.auth.token.get('admin', false) == true; }
+
+    // ---------- Usuarios ----------
+    match /users/{userId} {
+      allow read: if signedIn() && (uid() == userId || isAdmin());
+      allow create: if signedIn() && uid() == userId
+        && request.resource.data.uid == userId
+        && request.resource.data.role in ['client', 'provider']
+        && request.resource.data.ratingSum == 0
+        && request.resource.data.ratingCount == 0
+        // Sin autorización de tratamiento de datos ni mayoría de edad no se crea la cuenta.
+        && request.resource.data.consentAt is int
+        && request.resource.data.adultConfirmed == true;
+      allow update: if signedIn() && uid() == userId
+        && unchanged(['uid', 'role', 'email', 'ratingSum', 'ratingCount', 'createdAt', 'suspended', 'adultConfirmed'])
+        // Volver a aceptar la política: fecha y versión van juntas.
+        && (!request.resource.data.diff(resource.data).affectedKeys().hasAny(['consentAt', 'consentVersion'])
+            || (request.resource.data.consentAt is int && request.resource.data.consentVersion is string
+                && request.resource.data.consentAt > resource.data.get('consentAt', 0)))
+        && (!('name' in request.resource.data) || (request.resource.data.name is string && request.resource.data.name.size() >= 3 && request.resource.data.name.size() <= 80));
+    }
+
+    // ---------- Perfil profesional ----------
+    match /providers/{providerId} {
+      allow read: if signedIn();
+      allow create: if signedIn() && uid() == providerId
+        && get(/databases/$(database)/documents/users/$(uid())).data.role == 'provider'
+        && request.resource.data.uid == providerId
+        && request.resource.data.stats == { 'ratingSum': 0, 'ratingCount': 0, 'completedJobs': 0, 'cancelledJobs': 0 }
+        // 70 es el máximo posible sin historial (perfil completo, sin reseñas).
+        && request.resource.data.trustScore is int
+        && request.resource.data.trustScore <= 70
+        && request.resource.data.hourlyRate is number
+        && request.resource.data.serviceRadiusKm <= 30
+        && !('identityVerified' in request.resource.data)
+        && !('suspended' in request.resource.data);
+      allow update: if signedIn() && uid() == providerId
+        && unchanged(['uid', 'stats', 'trustScore', 'identityVerified', 'suspended'])
+        && request.resource.data.serviceRadiusKm <= 30;
+
+      // Franjas ocupadas (trabajo + desplazamiento). Las ve cualquiera para el matching,
+      // pero solo guardan inicio y fin, no datos del cliente.
+      match /busy/{bookingId} {
+        allow read: if signedIn();
+        allow create, update: if signedIn() && uid() == providerId;
+        allow delete: if signedIn() && (uid() == providerId
+          || get(/databases/$(database)/documents/bookings/$(bookingId)).data.clientId == uid());
+      }
+    }
+
+    // ---------- Solicitudes ----------
+    match /requests/{requestId} {
+      function isOwner() { return resource.data.clientId == uid(); }
+      function isMatched() { return uid() in resource.data.matchedProviderIds; }
+
+      allow read: if signedIn() && (isOwner() || isMatched() || isAdmin());
+      allow create: if signedIn()
+        && request.resource.data.clientId == uid()
+        && request.resource.data.status in ['open', 'quoting']
+        && request.resource.data.description is string
+        && request.resource.data.description.size() <= 600
+        && request.resource.data.matchedProviderIds.size() <= 5
+        && (!('photos' in request.resource.data) || request.resource.data.photos.size() <= 3);
+      allow update: if signedIn() && isOwner() && (
+        // Contratar o cancelar.
+        (onlyChanges(['status']) && request.resource.data.status in ['booked', 'cancelled'])
+        // Editar la solicitud mientras nadie haya sido contratado.
+        || (resource.data.status in ['open', 'quoting']
+          && onlyChanges(['description', 'attributes', 'classifiedBy', 'location', 'desiredStart', 'whenMode', 'photos', 'matchedProviderIds', 'updatedAt'])
+          && request.resource.data.description is string
+          && request.resource.data.description.size() <= 600
+          && request.resource.data.matchedProviderIds.size() <= 5
+          && (!('photos' in request.resource.data) || request.resource.data.photos.size() <= 3))
+      );
+
+      // Cotizaciones: el id del documento es el uid del prestador (una por prestador).
+      match /quotes/{providerId} {
+        function parent() { return get(/databases/$(database)/documents/requests/$(requestId)).data; }
+        allow read: if signedIn() && (uid() == providerId || parent().clientId == uid() || isAdmin());
+        allow create, update: if signedIn() && uid() == providerId
+          && request.resource.data.providerId == providerId
+          && uid() in parent().matchedProviderIds
+          && parent().status == 'quoting'
+          && request.resource.data.price is number
+          && request.resource.data.price >= 10000
+          && (!('start' in request.resource.data) || request.resource.data.start is int);
+      }
+    }
+
+    // ---------- Contrataciones ----------
+    match /bookings/{bookingId} {
+      function isClient() { return resource.data.clientId == uid(); }
+      function isProvider() { return resource.data.providerId == uid(); }
+      function from(s) { return resource.data.status == s; }
+      function to(s) { return request.resource.data.status == s; }
+      function unpaid() { return resource.data.payment.status == 'unpaid'; }
+      function hasProposal() { return 'priceProposal' in resource.data; }
+      function reviewExists() {
+        return existsAfter(/databases/$(database)/documents/reviews/$(bookingId + '_' + uid()));
+      }
+
+      allow read: if signedIn() && (isClient() || isProvider() || isAdmin());
+
+      allow create: if signedIn()
+        && request.resource.data.clientId == uid()
+        && request.resource.data.status == 'pending'
+        && request.resource.data.payment.status == 'unpaid'
+        && request.resource.data.reviewedByClient == false
+        && request.resource.data.reviewedByProvider == false
+        && request.resource.data.priceAgreed is bool
+        && !('priceProposal' in request.resource.data)
+        && get(/databases/$(database)/documents/requests/$(request.resource.data.requestId)).data.clientId == uid();
+
+      // Prestador: confirmar → iniciar → terminar, o cancelar antes de iniciar.
+      allow update: if signedIn() && isProvider() && (
+        (onlyChanges(['status']) && (
+          (from('pending') && to('confirmed')) ||
+          (from('confirmed') && to('in_progress')) ||
+          (from('in_progress') && to('completed'))
+        )) ||
+        (onlyChanges(['status', 'cancelledBy']) && (from('pending') || from('confirmed'))
+          && to('cancelled') && request.resource.data.cancelledBy == 'provider') ||
+        (onlyChanges(['reviewedByProvider']) && from('completed')
+          && request.resource.data.reviewedByProvider == true && reviewExists()) ||
+        // "Voy en camino": solo con el trabajo confirmado.
+        (onlyChanges(['onTheWayAt']) && from('confirmed') && request.resource.data.onTheWayAt is int) ||
+        // Proponer precio final: solo antes de pagar y con un monto razonable.
+        (onlyChanges(['priceProposal']) && unpaid()
+          && (from('confirmed') || from('in_progress') || from('completed'))
+          && request.resource.data.priceProposal.keys().hasOnly(['amount', 'note', 'proposedAt'])
+          && request.resource.data.priceProposal.amount is int
+          && request.resource.data.priceProposal.amount >= 10000
+          && request.resource.data.priceProposal.amount <= 20000000
+          && request.resource.data.priceProposal.note.size() <= 200)
+      );
+
+      // Cliente: cancelar antes de iniciar, pagar (simulado) y calificar.
+      allow update: if signedIn() && isClient() && (
+        (onlyChanges(['status', 'cancelledBy']) && (from('pending') || from('confirmed'))
+          && to('cancelled') && request.resource.data.cancelledBy == 'client') ||
+        // Pagar (simulado): no se puede con una propuesta de precio pendiente.
+        (onlyChanges(['payment']) && request.resource.data.payment.status == 'paid_simulated'
+          && resource.data.status != 'cancelled' && !hasProposal()) ||
+        // Aceptar la propuesta: el precio nuevo debe ser exactamente el propuesto.
+        (onlyChanges(['price', 'priceAgreed', 'priceProposal']) && hasProposal() && unpaid()
+          && !('priceProposal' in request.resource.data)
+          && request.resource.data.priceAgreed == true
+          && request.resource.data.price == resource.data.priceProposal.amount) ||
+        // Rechazar la propuesta: se borra y el precio queda igual.
+        (onlyChanges(['priceProposal']) && hasProposal() && !('priceProposal' in request.resource.data)) ||
+        (onlyChanges(['reviewedByClient']) && from('completed')
+          && request.resource.data.reviewedByClient == true && reviewExists())
+      );
+    }
+
+    // ---------- Reseñas (en ambas direcciones) ----------
+    match /reviews/{reviewId} {
+      function reviewTargetsOtherParty(r) {
+        let b = get(/databases/$(database)/documents/bookings/$(r.bookingId)).data;
+        return b.status == 'completed' && (
+          (b.clientId == uid() && r.targetId == b.providerId && r.targetRole == 'provider') ||
+          (b.providerId == uid() && r.targetId == b.clientId && r.targetRole == 'client')
+        );
+      }
+
+      allow read: if signedIn();
+      allow create: if signedIn()
+        && reviewId == request.resource.data.bookingId + '_' + uid()
+        && request.resource.data.authorId == uid()
+        && request.resource.data.rating is int
+        && request.resource.data.rating >= 1 && request.resource.data.rating <= 5
+        && request.resource.data.comment.size() <= 400
+        && request.resource.data.keys().hasOnly(['id', 'bookingId', 'authorId', 'authorName', 'targetId', 'targetRole', 'rating', 'comment', 'createdAt'])
+        && reviewTargetsOtherParty(request.resource.data);
+      allow update, delete: if false;
+
+    }
+
+    // ---------- Seguimiento "en camino" (solo lo ven el cliente y el prestador) ----------
+    match /tracking/{bookingId} {
+      function booking() { return get(/databases/$(database)/documents/bookings/$(bookingId)).data; }
+      allow read: if signedIn() && (resource.data.clientId == uid() || resource.data.providerId == uid());
+      allow write: if signedIn()
+        && booking().providerId == uid()
+        && booking().status == 'confirmed'
+        && request.resource.data.providerId == uid()
+        && request.resource.data.clientId == booking().clientId
+        && request.resource.data.lat is number && request.resource.data.lng is number;
+    }
+
+    // ---------- Reportes de usuarios ----------
+    match /reports/{reportId} {
+      allow read: if isAdmin() || (signedIn() && resource.data.reporterId == uid());
+      allow create: if signedIn()
+        && request.resource.data.reporterId == uid()
+        && request.resource.data.targetId != uid()
+        && request.resource.data.status == 'open'
+        && request.resource.data.reason in ['no_show', 'bad_treatment', 'overcharge', 'bad_work', 'inappropriate', 'fraud', 'safety', 'other']
+        && request.resource.data.details is string
+        && request.resource.data.details.size() <= 1000
+        && !('resolution' in request.resource.data);
+      // Resolver un reporte se hace con la función adminResolveReport (deja bitácora).
+      allow update, delete: if false;
+    }
+
+    // ---------- Solicitudes de habeas data (Ley 1581) ----------
+    match /dataRequests/{requestId} {
+      allow read: if isAdmin() || (signedIn() && resource.data.userId == uid());
+      allow create: if signedIn()
+        && request.resource.data.userId == uid()
+        && request.resource.data.status == 'open'
+        && request.resource.data.type in ['consulta', 'actualizacion', 'supresion', 'revocatoria', 'reclamo']
+        && request.resource.data.message is string
+        && request.resource.data.message.size() >= 10
+        && request.resource.data.message.size() <= 1000
+        && request.resource.data.dueAt is int
+        && !('response' in request.resource.data);
+      // Responder se hace con la función adminAnswerDataRequest (deja bitácora).
+      allow update, delete: if false;
+    }
+
+    // ---------- Bitácora de administración ----------
+    match /adminLog/{entryId} {
+      allow read: if isAdmin();
+      allow write: if false;
+    }
+
+    // ---------- Reputación del cliente (solo la escribe el servidor) ----------
+    match /reputation/{userId} {
+      allow read: if signedIn();
+      allow write: if false;
+    }
+
+    // ---------- Notificaciones (las crea el servidor; el dueño solo las marca como leídas) ----------
+    match /notifications/{notificationId} {
+      allow read: if signedIn() && resource.data.userId == uid();
+      allow update: if signedIn() && resource.data.userId == uid()
+        && onlyChanges(['read']) && request.resource.data.read == true;
+      allow create, delete: if false;
+    }
+
+    // ---------- Chat ----------
+    match /chats/{chatId} {
+      function participantsOk(d) {
+        return d.participants.size() == 2 && uid() in d.participants
+          && chatId == d.participants[0] + '_' + d.participants[1];
+      }
+      allow read: if signedIn() && uid() in resource.data.participants;
+      allow create: if signedIn() && participantsOk(request.resource.data);
+      allow update: if signedIn() && uid() in resource.data.participants
+        && request.resource.data.participants == resource.data.participants;
+
+      match /messages/{messageId} {
+        function isParticipant() {
+          return uid() in get(/databases/$(database)/documents/chats/$(chatId)).data.participants;
+        }
+        allow read: if signedIn() && isParticipant();
+        allow create: if signedIn() && isParticipant()
+          && request.resource.data.senderId == uid()
+          && request.resource.data.keys().hasOnly(['senderId', 'text', 'imageUrl', 'audioUrl', 'videoUrl', 'mediaPath', 'durationSec', 'transcriptStatus', 'createdAt'])
+          && (!('text' in request.resource.data) || request.resource.data.text.size() <= 2000)
+          // La transcripción solo la escribe el servidor; la app solo puede pedirla.
+          && (!('transcriptStatus' in request.resource.data) || request.resource.data.transcriptStatus == 'pending')
+          && (!('mediaPath' in request.resource.data)
+              || request.resource.data.mediaPath.matches('chats/' + chatId + '/' + uid() + '_.*'));
+        allow update, delete: if false;
+      }
+    }
+  }
+}
